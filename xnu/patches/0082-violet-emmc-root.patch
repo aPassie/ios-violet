@@ -1,0 +1,572 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..74b1b11 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -141,6 +141,461 @@ dma_clean(uint32_t off, uint32_t len)
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++/*
++ * VIOLET (Redmi Note 7 Pro, SM6150): eMMC backend.
++ *
++ * violet boots from eMMC on SDHC1 (sdhci-msm-v5 at 0x7c4000), not UFS. ABL
++ * powers that host down before it jumps to us (bus power off, SD clock off),
++ * so this backend brings it up from scratch: PWRCTL power handshake, 1.8 V
++ * pads, the GCC SDCC1 clock (400 kHz for identification, then 25 MHz or, with
++ * boot-arg emmchs=1, 50 MHz high speed), card init (CMD0/1/2/3/7), 8-bit bus.
++ * Data moves by polled PIO through the SDHCI buffer port, multi-block with
++ * auto-CMD12. The card is presented as 4 KiB "device blocks" (8 sectors), so
++ * partition bounds, the bounce buffer and the log ring are shared with the
++ * UFS path above. Selected by ADT node /violet-emmc with
++ * reg = <hc_mem 0x1000 gcc_base 0x4000> (gcc_base = 0x110000; SDCC1 clock
++ * registers at +0x2000). Bring-up sequence verified on the phone with a
++ * bare-metal probe first (violet-shim m2).
++ */
++#define EMMC_SECT       512u
++#define EMMC_SPB        (UFS_BLOCK / EMMC_SECT)
++
++#define SD_BLKSZ        0x04
++#define SD_BLKCNT       0x06
++#define SD_ARG          0x08
++#define SD_XFERMODE     0x0c
++#define SD_COMMAND      0x0e
++#define SD_RESP         0x10
++#define SD_DATA         0x20
++#define SD_PSTATE       0x24
++#define SD_HCTL1        0x28
++#define SD_POWER        0x29
++#define SD_CLOCK        0x2c
++#define SD_TOUT         0x2e
++#define SD_SWRST        0x2f
++#define SD_INTSTS       0x30
++#define SD_INTEN        0x34
++#define SD_INTSIG       0x38
++#define SD_HCTL2        0x3e
++#define MSM_DLL_CONFIG  0x200
++#define MSM_VENDOR_SPEC 0x20c
++#define MSM_PWR_STATUS  0x240
++#define MSM_PWR_MASK    0x244
++#define MSM_PWR_CLEAR   0x248
++#define MSM_PWR_CTL     0x24c
++#define MSM_VENDOR_SPEC3 0x250
++#define GCC_SDCC1_RCGR  0x2028
++#define GCC_SDCC1_CFG   0x202c
++#define GCC_SDCC1_M     0x2030
++#define GCC_SDCC1_N     0x2034
++#define GCC_SDCC1_D     0x2038
++
++#define INT_CMD_DONE    0x0001u
++#define INT_XFER_DONE   0x0002u
++#define INT_BUF_WR      0x0010u
++#define INT_BUF_RD      0x0020u
++#define INT_ERROR       0x8000u
++
++static bool use_emmc;
++static vm_offset_t emmc_gcc;
++static uint32_t emmc_rca = 1;
++static bool emmc_cache_on;
++
++static inline uint8_t sd_r8(uint32_t o) { return *(volatile uint8_t *)(su.regs + o); }
++static inline uint16_t sd_r16(uint32_t o) { return *(volatile uint16_t *)(su.regs + o); }
++static inline uint32_t sd_r32(uint32_t o) { return *(volatile uint32_t *)(su.regs + o); }
++static inline void sd_w8(uint32_t o, uint8_t v) { *(volatile uint8_t *)(su.regs + o) = v; }
++static inline void sd_w16(uint32_t o, uint16_t v) { *(volatile uint16_t *)(su.regs + o) = v; }
++static inline void sd_w32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(su.regs + o) = v; }
++static inline uint32_t gcc_r32(uint32_t o) { return *(volatile uint32_t *)(emmc_gcc + o); }
++static inline void gcc_w32(uint32_t o, uint32_t v) { *(volatile uint32_t *)(emmc_gcc + o) = v; }
++
++static uint64_t
++emmc_deadline(uint64_t us)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(us * NSEC_PER_USEC, &t);
++	return mach_absolute_time() + t;
++}
++
++/* Wait until (reg & mask) is nonzero (set) or zero (!set). */
++static int
++emmc_poll32(uint32_t reg, uint32_t mask, bool set, uint64_t us)
++{
++	uint64_t end = emmc_deadline(us);
++	for (;;) {
++		uint32_t v = sd_r32(reg);
++		if (set ? (v & mask) : !(v & mask)) {
++			return 0;
++		}
++		if (mach_absolute_time() > end) {
++			return ETIMEDOUT;
++		}
++	}
++}
++
++static uint32_t
++emmc_pwr_wait(uint32_t want)
++{
++	uint64_t end = emmc_deadline(100000);
++	uint32_t s;
++	do {
++		s = sd_r32(MSM_PWR_STATUS) & 0xf;
++		if (s & want) {
++			return s;
++		}
++	} while (mach_absolute_time() < end);
++	printf("VIOLET EMMC: PWRCTL 0x%x never raised (status 0x%x)\n", want, s);
++	return s;
++}
++
++static void
++emmc_pwr_ack(uint32_t s)
++{
++	s &= 0xf;
++	if (!s) {
++		return;
++	}
++	for (int i = 0; i < 10; i++) {
++		sd_w32(MSM_PWR_CLEAR, s);
++		__builtin_arm_dsb(0xf);
++		delay(10);
++		if (!(sd_r32(MSM_PWR_STATUS) & s)) {
++			break;
++		}
++	}
++	sd_w32(MSM_PWR_CTL, ((s & 0x3) ? 0x1 : 0) | ((s & 0xc) ? 0x4 : 0));
++	__builtin_arm_dsb(0xf);
++}
++
++static int
++emmc_rcg_set(uint32_t cfg, uint32_t m, uint32_t n, uint32_t d, bool mnd)
++{
++	if (mnd) {
++		gcc_w32(GCC_SDCC1_M, m);
++		gcc_w32(GCC_SDCC1_N, n);
++		gcc_w32(GCC_SDCC1_D, d);
++	}
++	gcc_w32(GCC_SDCC1_CFG, cfg);
++	__builtin_arm_dsb(0xf);
++	gcc_w32(GCC_SDCC1_RCGR, gcc_r32(GCC_SDCC1_RCGR) | 1);  /* UPDATE */
++	__builtin_arm_dsb(0xf);
++	uint64_t end = emmc_deadline(5000);
++	while (gcc_r32(GCC_SDCC1_RCGR) & 1) {
++		if (mach_absolute_time() > end) {
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++/* MSM does not use the SDHCI divider: GCC sets the rate, divider stays 0. */
++static int
++emmc_set_clock(uint32_t cfg, uint32_t m, uint32_t n, uint32_t d, bool mnd)
++{
++	sd_w16(SD_CLOCK, sd_r16(SD_CLOCK) & ~0x0004);
++	delay(10);
++	int error = emmc_rcg_set(cfg, m, n, d, mnd);
++	if (error) {
++		return error;
++	}
++	sd_w16(SD_CLOCK, 0);
++	sd_w16(SD_CLOCK, 0x0001);
++	uint64_t end = emmc_deadline(20000);
++	while (!(sd_r16(SD_CLOCK) & 0x0002)) {
++		if (mach_absolute_time() > end) {
++			return ETIMEDOUT;
++		}
++	}
++	sd_w16(SD_CLOCK, sd_r16(SD_CLOCK) | 0x0004);
++	delay(2000);
++	return 0;
++}
++
++static void
++emmc_reset_lines(void)
++{
++	for (uint8_t b = 2; b <= 4; b += 2) {
++		sd_w8(SD_SWRST, b);
++		uint64_t end = emmc_deadline(100000);
++		while ((sd_r8(SD_SWRST) & b) && mach_absolute_time() < end) {
++		}
++	}
++	sd_w32(SD_INTSTS, 0xffffffff);
++}
++
++/*
++ * One command. flags = SDHCI command flags (low byte). With data, nblk
++ * 512-byte blocks move by PIO between the card and buf (write when wr).
++ * resp gets R1/R3 (resp[0]) or R2 (resp[0..3]).
++ */
++static int
++emmc_cmd(uint32_t idx, uint32_t flags, uint32_t arg, uint32_t nblk, bool wr,
++    uint32_t *buf, uint32_t *resp)
++{
++	bool busy = (flags & 3) == 3;
++	uint32_t inhibit = (nblk || busy) ? 3 : 1, s;
++
++	if (emmc_poll32(SD_PSTATE, inhibit, false, 500000)) {
++		printf("VIOLET EMMC: CMD%u: lines busy (pstate 0x%x)\n", idx, sd_r32(SD_PSTATE));
++		emmc_reset_lines();
++		return EBUSY;
++	}
++	sd_w32(SD_INTSTS, 0xffffffff);
++	uint16_t mode = 0;
++	if (nblk) {
++		sd_w8(SD_TOUT, 0x0e);
++		sd_w16(SD_BLKSZ, EMMC_SECT);
++		sd_w16(SD_BLKCNT, (uint16_t)nblk);
++		mode = 0x0002 | (wr ? 0 : 0x0010);                      /* BLK_CNT_EN, READ */
++		if (nblk > 1) {
++			mode |= 0x0020 | 0x0004;                            /* MULTI, AUTO_CMD12 */
++		}
++	}
++	sd_w32(SD_ARG, arg);
++	sd_w16(SD_XFERMODE, mode);
++	sd_w16(SD_COMMAND, (uint16_t)((idx << 8) | flags));
++
++	if (emmc_poll32(SD_INTSTS, INT_CMD_DONE | INT_ERROR, true, 250000)) {
++		printf("VIOLET EMMC: CMD%u timed out\n", idx);
++		emmc_reset_lines();
++		return ETIMEDOUT;
++	}
++	s = sd_r32(SD_INTSTS);
++	if (s & INT_ERROR) {
++		printf("VIOLET EMMC: CMD%u error, status 0x%x\n", idx, s);
++		emmc_reset_lines();
++		return EIO;
++	}
++	if (resp) {
++		if ((flags & 3) == 1) {         /* R2: 136 bits, CRC stripped, shifted by 8 */
++			for (int i = 0; i < 4; i++) {
++				resp[i] = sd_r32(SD_RESP + (3 - i) * 4) << 8;
++				if (i < 3) {
++					resp[i] |= sd_r8(SD_RESP + (3 - i) * 4 - 1);
++				}
++			}
++		} else {
++			resp[0] = sd_r32(SD_RESP);
++		}
++	}
++	sd_w32(SD_INTSTS, INT_CMD_DONE);
++
++	if (busy && !nblk) {                    /* R1b: wait for DAT0 high, ignore data timeout */
++		if (emmc_poll32(SD_PSTATE, 1u << 20, true, 2000000)) {
++			printf("VIOLET EMMC: CMD%u busy timeout\n", idx);
++		}
++		sd_w32(SD_INTSTS, 0xffffffff);
++	}
++	for (uint32_t b = 0; b < nblk; b++) {
++		uint32_t want = wr ? INT_BUF_WR : INT_BUF_RD;
++		if (emmc_poll32(SD_INTSTS, want | INT_ERROR, true, 1000000) ||
++		    ((s = sd_r32(SD_INTSTS)) & INT_ERROR)) {
++			printf("VIOLET EMMC: CMD%u block %u/%u failed, status 0x%x\n",
++			    idx, b, nblk, sd_r32(SD_INTSTS));
++			emmc_reset_lines();
++			return EIO;
++		}
++		sd_w32(SD_INTSTS, want);
++		uint32_t *p = buf + b * (EMMC_SECT / 4);
++		if (wr) {
++			for (uint32_t i = 0; i < EMMC_SECT / 4; i++) {
++				sd_w32(SD_DATA, p[i]);
++			}
++		} else {
++			for (uint32_t i = 0; i < EMMC_SECT / 4; i++) {
++				p[i] = sd_r32(SD_DATA);
++			}
++		}
++	}
++	if (nblk) {
++		/* writes: the host raises XFER_DONE only after the card's busy ends */
++		if (emmc_poll32(SD_INTSTS, INT_XFER_DONE | INT_ERROR, true, 5000000) ||
++		    ((s = sd_r32(SD_INTSTS)) & INT_ERROR)) {
++			printf("VIOLET EMMC: CMD%u transfer end failed, status 0x%x\n", idx, sd_r32(SD_INTSTS));
++			emmc_reset_lines();
++			return EIO;
++		}
++		sd_w32(SD_INTSTS, 0xffffffff);
++	}
++	return 0;
++}
++
++static int
++emmc_status(uint32_t *r1)
++{
++	return emmc_cmd(13, 0x1a, emmc_rca << 16, 0, false, NULL, r1);
++}
++
++/* Sector-level transfer: count sectors at sector lba to/from buf (<= 65535). */
++static int
++emmc_xfer(uint64_t lba, uint32_t count, void *buf, bool wr)
++{
++	if (lba + count > UINT32_MAX || count == 0 || count > 0xffff) {
++		return EINVAL;
++	}
++	uint32_t r1 = 0;
++	int error = emmc_cmd(count > 1 ? (wr ? 25 : 18) : (wr ? 24 : 17), 0x3a,
++	    (uint32_t)lba, count, wr, (uint32_t *)buf, NULL);
++	if (!error && wr) {
++		error = emmc_status(&r1);
++		if (!error && (r1 & 0xfdf90000u)) {     /* any R1 error bit */
++			printf("VIOLET EMMC: write at 0x%llx: card status 0x%x\n", lba, r1);
++			error = EIO;
++		}
++	}
++	return error;
++}
++
++static int
++emmc_take_over_host(void)
++{
++	uint32_t r[4] = { 0 }, s = 0;
++	int error;
++
++	/* A. stale power-control status, B. vendor defaults, DLL off, 1.8 V pads */
++	emmc_pwr_ack(sd_r32(MSM_PWR_STATUS));
++	sd_w32(MSM_PWR_MASK, 0xf);
++	sd_w32(MSM_VENDOR_SPEC, 0x00000a9c);
++	sd_w32(MSM_VENDOR_SPEC, sd_r32(MSM_VENDOR_SPEC) | (1u << 15) | (1u << 16));
++	sd_w32(MSM_DLL_CONFIG, sd_r32(MSM_DLL_CONFIG) | (1u << 30));
++	sd_w32(MSM_DLL_CONFIG, sd_r32(MSM_DLL_CONFIG) | (1u << 29));
++	sd_w32(MSM_VENDOR_SPEC3, sd_r32(MSM_VENDOR_SPEC3) & ~((1u << 3) | (1u << 10)));
++	sd_w16(SD_HCTL2, 0);
++	/* C. bus power */
++	sd_w8(SD_POWER, 0x0d);
++	__builtin_arm_dsb(0xf);
++	emmc_pwr_ack(emmc_pwr_wait(0x2));
++	sd_w32(MSM_VENDOR_SPEC, sd_r32(MSM_VENDOR_SPEC) | (1u << 15) | (1u << 16));
++	delay(10000);
++	/* D. 1.8 V signalling */
++	sd_w16(SD_HCTL2, sd_r16(SD_HCTL2) | 0x0008);
++	__builtin_arm_dsb(0xf);
++	emmc_pwr_ack(emmc_pwr_wait(0x4));
++	delay(5000);
++	/* E. polled status */
++	sd_w32(SD_INTSIG, 0);
++	sd_w32(SD_INTEN, 0x03bf003b);
++	sd_w32(SD_INTSTS, 0xffffffff);
++	sd_w8(SD_HCTL1, 0);
++	/* F. 400 kHz from XO */
++	error = emmc_set_clock(0x2017, 1, 0xfc, 0xfb, true);
++	if (error) {
++		printf("VIOLET EMMC: identification clock failed\n");
++		return error;
++	}
++
++	emmc_cmd(0, 0x00, 0, 0, false, NULL, NULL);
++	delay(10000);
++	for (int i = 0; i < 100; i++) {
++		if (!emmc_cmd(1, 0x02, 0x40ff8080, 0, false, NULL, r) && (r[0] & 0x80000000u)) {
++			break;
++		}
++		delay(10000);
++	}
++	if (!(r[0] & 0x80000000u)) {
++		printf("VIOLET EMMC: card never left busy (OCR 0x%x)\n", r[0]);
++		return ENXIO;
++	}
++	if ((error = emmc_cmd(2, 0x09, 0, 0, false, NULL, r)) ||
++	    (error = emmc_cmd(3, 0x1a, emmc_rca << 16, 0, false, NULL, NULL)) ||
++	    (error = emmc_cmd(7, 0x1b, emmc_rca << 16, 0, false, NULL, NULL))) {
++		return error;
++	}
++	/* EXT_CSD into the bounce buffer */
++	const uint8_t *ec = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if ((error = emmc_cmd(8, 0x3a, 0, 1, false, (uint32_t *)(su.dma + DMA_BOUNCE), NULL))) {
++		return error;
++	}
++	uint32_t sectors = ec[212] | ec[213] << 8 | ec[214] << 16 | (uint32_t)ec[215] << 24;
++	emmc_cache_on = ec[33] & 1;
++	printf("VIOLET EMMC: EXT_CSD rev %u, %u sectors, partition config 0x%x, cache %s\n",
++	    ec[192], sectors, ec[179], emmc_cache_on ? "on" : "off");
++	if (ec[179] & 7) {                      /* access the user area, not boot/RPMB */
++		emmc_cmd(6, 0x1b, (2u << 24) | (179u << 16) | (0x07u << 8), 0, false, NULL, NULL);
++	}
++	/* 8-bit bus */
++	if ((error = emmc_cmd(6, 0x1b, 0x03b70200, 0, false, NULL, NULL)) ||
++	    (error = emmc_status(&s)) || ((s >> 9) & 0xf) != 4 || (s & 0x80)) {
++		printf("VIOLET EMMC: 8-bit switch failed (r1 0x%x)\n", s);
++		return error ? error : EIO;
++	}
++	sd_w8(SD_HCTL1, (sd_r8(SD_HCTL1) & ~0x02) | 0x20);
++	uint32_t hs = 0;
++	PE_parse_boot_argn("emmchs", &hs, sizeof(hs));
++	if (hs == 1 && !emmc_cmd(6, 0x1b, 0x03b90100, 0, false, NULL, NULL)) {
++		sd_w8(SD_HCTL1, sd_r8(SD_HCTL1) | 0x04);
++		error = emmc_set_clock(0x060b, 0, 0, 0, false);         /* GPLL0_AUX2 /6 = 50 MHz */
++	} else {
++		error = emmc_set_clock(0x260b, 1, 0xfe, 0xfd, true);    /* 25 MHz */
++	}
++	if (!error) {
++		error = emmc_status(&s);
++	}
++	if (error || ((s >> 9) & 0xf) != 4) {
++		printf("VIOLET EMMC: card not in transfer state after speed switch (r1 0x%x)\n", s);
++		return error ? error : EIO;
++	}
++	printf("VIOLET EMMC: host up, 8-bit %s\n", hs == 1 ? "50 MHz HS" : "25 MHz");
++	return 0;
++}
++
++static int
++emmc_find_partition(const char *want)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = emmc_xfer(1, 1, b, false);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("VIOLET EMMC: no GPT\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	uint32_t nsect = (nent * esz + EMMC_SECT - 1) / EMMC_SECT;
++	if (esz != 128 || nent == 0 || nsect * EMMC_SECT > BOUNCE_SIZE) {
++		printf("VIOLET EMMC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	if ((error = emmc_xfer(entry_lba, nsect, b, false))) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first || (first % EMMC_SPB)) {
++			printf("VIOLET EMMC: partition \"%s\" not 4 KiB aligned (0x%llx)\n", want, first);
++			return ENXIO;
++		}
++		/* whole 4 KiB device blocks only; a sub-block tail is left unused */
++		su.first_block = first / EMMC_SPB;
++		su.nblocks = (last - first + 1) / EMMC_SPB;
++		return 0;
++	}
++	printf("VIOLET EMMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -263,6 +718,9 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
++	if (use_emmc) {
++		return emmc_xfer(lba * EMMC_SPB, count * EMMC_SPB, (void *)(su.dma + DMA_BOUNCE), false);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x28, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -284,6 +742,9 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	if (use_emmc) {
++		return emmc_xfer(lba * EMMC_SPB, count * EMMC_SPB, (void *)(su.dma + DMA_BOUNCE), true);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -296,6 +757,16 @@ static int
+ ufs_sync_cache(void)
+ {
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
++	if (use_emmc) {
++		uint32_t r1 = 0;
++		if (emmc_cache_on) {                    /* EXT_CSD[32] FLUSH_CACHE = 1 */
++			int error = emmc_cmd(6, 0x1b, (3u << 24) | (32u << 16) | (1u << 8), 0, false, NULL, NULL);
++			if (error) {
++				return error;
++			}
++		}
++		return emmc_status(&r1);
++	}
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
+@@ -592,10 +1063,14 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	if (SecureDTLookupEntry(NULL, "/violet-emmc", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
++	    size >= 4 * sizeof(uintptr_t)) {
++		use_emmc = true;
++	} else if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		printf("SWEET UFS: no /sweet-ufs or /violet-emmc node in the device tree\n");
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+@@ -608,6 +1083,9 @@ sweet_ufs_init(void)
+ 	su.wait = (wait == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	if (use_emmc) {
++		emmc_gcc = ml_io_map(reg[2], reg[3]);
++	}
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -622,15 +1100,22 @@ sweet_ufs_init(void)
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++	if (use_emmc) {
++		error = emmc_take_over_host();
++		if (!error) {
++			error = emmc_find_partition(want);
++		}
++	} else {
++		error = ufs_take_over_host();
++		if (!error) {
++			static const uint8_t tur[6] = { 0x00 };
++			/* The first command after the bootloader may report a unit attention. */
++			for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			}
++		}
++		if (!error) {
++			error = ufs_find_partition(want);
+ 		}
+-	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+@@ -651,8 +1136,8 @@ sweet_ufs_init(void)
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
+-	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+-	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
++	printf("SWEET UFS: \"%s\" on %s %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, use_emmc ? "eMMC" : "LUN", su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
