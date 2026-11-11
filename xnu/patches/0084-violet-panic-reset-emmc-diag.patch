@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 84a0ead..aeb9183 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -357,7 +357,8 @@ emmc_cmd(uint32_t idx, uint32_t flags, uint32_t arg, uint32_t nblk, bool wr,
+ 	sd_w16(SD_COMMAND, (uint16_t)((idx << 8) | flags));
+ 
+ 	if (emmc_poll32(SD_INTSTS, INT_CMD_DONE | INT_ERROR, true, 250000)) {
+-		printf("VIOLET EMMC: CMD%u timed out\n", idx);
++		printf("VIOLET EMMC: CMD%u timed out (int 0x%x pstate 0x%x clk 0x%x)\n", idx,
++		    sd_r32(SD_INTSTS), sd_r32(SD_PSTATE), sd_r16(SD_CLOCK));
+ 		emmc_reset_lines();
+ 		return ETIMEDOUT;
+ 	}
+@@ -418,6 +419,7 @@ emmc_cmd(uint32_t idx, uint32_t flags, uint32_t arg, uint32_t nblk, bool wr,
+ 		}
+ 		sd_w32(SD_INTSTS, 0xffffffff);
+ 	}
++	delay(100);
+ 	return 0;
+ }
+ 
+@@ -453,6 +455,9 @@ emmc_take_over_host(void)
+ 	uint32_t r[4] = { 0 }, s = 0;
+ 	int error;
+ 
++	printf("VIOLET EMMC: entry pstate 0x%x hctl 0x%x clk 0x%x pwr 0x%x vspec 0x%x rcg cfg 0x%x\n",
++	    sd_r32(SD_PSTATE), sd_r32(SD_HCTL1), sd_r16(SD_CLOCK), sd_r32(MSM_PWR_STATUS),
++	    sd_r32(MSM_VENDOR_SPEC), gcc_r32(GCC_SDCC1_CFG));
+ 	/* A. stale power-control status, B. vendor defaults, DLL off, 1.8 V pads */
+ 	emmc_pwr_ack(sd_r32(MSM_PWR_STATUS));
+ 	sd_w32(MSM_PWR_MASK, 0xf);
+@@ -473,6 +478,8 @@ emmc_take_over_host(void)
+ 	__builtin_arm_dsb(0xf);
+ 	emmc_pwr_ack(emmc_pwr_wait(0x4));
+ 	delay(5000);
++	printf("VIOLET EMMC: power on: pwr 0x%x hctl2 0x%x vspec 0x%x\n",
++	    sd_r8(SD_POWER), sd_r16(SD_HCTL2), sd_r32(MSM_VENDOR_SPEC));
+ 	/* E. polled status */
+ 	sd_w32(SD_INTSIG, 0);
+ 	sd_w32(SD_INTEN, 0x03bf003b);
+@@ -485,8 +492,10 @@ emmc_take_over_host(void)
+ 		return error;
+ 	}
+ 
+-	emmc_cmd(0, 0x00, 0, 0, false, NULL, NULL);
++	printf("VIOLET EMMC: 400 kHz clock on (clk 0x%x cfg 0x%x)\n", sd_r16(SD_CLOCK), gcc_r32(GCC_SDCC1_CFG));
++	error = emmc_cmd(0, 0x00, 0, 0, false, NULL, NULL);
+ 	delay(10000);
++	printf("VIOLET EMMC: CMD0 %d\n", error);
+ 	for (int i = 0; i < 100; i++) {
+ 		if (!emmc_cmd(1, 0x02, 0x40ff8080, 0, false, NULL, r) && (r[0] & 0x80000000u)) {
+ 			break;
+@@ -497,11 +506,13 @@ emmc_take_over_host(void)
+ 		printf("VIOLET EMMC: card never left busy (OCR 0x%x)\n", r[0]);
+ 		return ENXIO;
+ 	}
++	printf("VIOLET EMMC: CMD1 OCR 0x%x\n", r[0]);
+ 	if ((error = emmc_cmd(2, 0x09, 0, 0, false, NULL, r)) ||
+ 	    (error = emmc_cmd(3, 0x1a, emmc_rca << 16, 0, false, NULL, NULL)) ||
+ 	    (error = emmc_cmd(7, 0x1b, emmc_rca << 16, 0, false, NULL, NULL))) {
+ 		return error;
+ 	}
++	printf("VIOLET EMMC: CMD2/3/7 ok, CID 0x%08x%08x\n", r[0], r[1]);
+ 	/* EXT_CSD into the bounce buffer */
+ 	const uint8_t *ec = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	if ((error = emmc_cmd(8, 0x3a, 0, 1, false, (uint32_t *)(su.dma + DMA_BOUNCE), NULL))) {
+@@ -1362,6 +1373,31 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * VIOLET: platform reset, called from kdp_machine_reboot_type()
++ * (osfmk/kern/debug.c) after PEHaltRestart. There is no reset driver, so a
++ * panic used to leave the phone frozen until a long power-key press, which is
++ * a cold reset that also decays the pstore RAM holding the logs. After a
++ * panic: wait panicreset= seconds (default 20, 0 = stay on the panic screen),
++ * then PSCI SYSTEM_RESET (warm: RAM keeps the logs, the phone boots Android).
++ */
++void violet_platform_reset(unsigned int type);
++
++void
++violet_platform_reset(unsigned int type)
++{
++	uint32_t secs = 20;
++	PE_parse_boot_argn("panicreset", &secs, sizeof(secs));
++	if (type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) {
++		if (secs == 0) {
++			return;
++		}
++		delay((int)MIN(secs, 600u) * 1000000);
++	}
++	register uint64_t x0 __asm__("x0") = 0x84000009;   /* PSCI SYSTEM_RESET */
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..7a5029b 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1176,6 +1176,11 @@ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ 	} else {
+ 		PEHaltRestart(type);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* violet/sweet: no platform reset driver; warm-reset through PSCI (bsd/dev/sweet_ufs.c) */
++	extern void violet_platform_reset(unsigned int type);
++	violet_platform_reset(type);
++#endif
+ 	halt_all_cpus(TRUE);
+ }
+ 
