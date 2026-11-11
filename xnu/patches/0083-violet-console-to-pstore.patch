@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 74b1b11..84a0ead 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1173,6 +1173,75 @@ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+ 
++/*
++ * VIOLET: mirror the console into a Linux pstore (ramoops) zone, so the whole
++ * kernel log of a run survives the warm reset and Android shows it as
++ * /sys/fs/pstore/pmsg-ramoops-0. ADT node /violet-pstore, reg = <pa size>
++ * (violet: the ramoops pmsg zone, 0xa1a00000 + 4 MiB, outside XNU's RAM).
++ * Format = Linux persistent_ram_buffer: u32 sig "DBGC", u32 start (next write
++ * offset), u32 size (valid bytes), data[]. Mapped at the first root lookup;
++ * everything already in the console ring is copied in then.
++ */
++static volatile uint8_t *violet_pstore;
++static uint64_t violet_pstore_base;
++static uint32_t violet_pstore_cap;
++
++static void
++violet_pstore_put(uint64_t at, const char *c, int size)
++{
++	volatile uint8_t *p = violet_pstore;
++	uint32_t cap = violet_pstore_cap;
++	if (!p || size <= 0) {
++		return;
++	}
++	for (int i = 0; i < size; i++) {
++		p[12 + (at + (uint64_t)i) % cap] = (uint8_t)c[i];
++	}
++	uint64_t end = at + (uint64_t)size;
++	volatile uint32_t *h = (volatile uint32_t *)p;
++	h[1] = (uint32_t)(end % cap);
++	h[2] = (uint32_t)MIN(end, (uint64_t)cap);
++	h[0] = 0x43474244;                      /* "DBGC" */
++}
++
++static void
++violet_pstore_start(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	if (violet_pstore ||
++	    SecureDTLookupEntry(NULL, "/violet-pstore", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t) || reg[1] <= 4096) {
++		return;
++	}
++	volatile uint8_t *p = (volatile uint8_t *)ml_io_map(reg[0], reg[1]);
++	if (!p) {
++		return;
++	}
++	violet_pstore_cap = (uint32_t)reg[1] - 12;
++	volatile uint32_t *h = (volatile uint32_t *)p;
++	h[0] = 0; h[1] = 0; h[2] = 0;
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t from = total > SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : 0;
++	violet_pstore_base = from;
++	__builtin_arm_dmb(0xb);
++	violet_pstore = p;
++	/* replay what the console printed before the zone was mapped */
++	for (uint64_t at = from; at < total;) {
++		char chunk[256];
++		int n = (int)MIN((uint64_t)sizeof(chunk), total - at);
++		for (int i = 0; i < n; i++) {
++			chunk[i] = sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE];
++		}
++		violet_pstore_put(at - from, chunk, n);
++		at += (uint64_t)n;
++	}
++	printf("VIOLET PSTORE: console mirrored to 0x%lx (+0x%lx), %llu bytes replayed\n",
++	    (unsigned long)reg[0], (unsigned long)reg[1], total - from);
++}
++
+ void
+ sweet_log_append(const char *c, int size)
+ {
+@@ -1183,6 +1252,9 @@ sweet_log_append(const char *c, int size)
+ 	for (int i = 0; i < size; i++) {
+ 		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
+ 	}
++	if (violet_pstore && at >= violet_pstore_base) {
++		violet_pstore_put(at - violet_pstore_base, c, size);
++	}
+ }
+ 
+ /*
+@@ -1296,6 +1368,7 @@ int sweet_ufs_rootdev(dev_t *dev);
+ int
+ sweet_ufs_rootdev(dev_t *dev)
+ {
++	violet_pstore_start();
+ 	if (!su.ready) {
+ 		int error = sweet_ufs_init();
+ 		if (error) {
