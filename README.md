@@ -1,203 +1,136 @@
-# ios-sweet
+# iOS 16 on the Redmi Note 7 Pro (violet)
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) running the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X** on the Xiaomi **Redmi Note 7 Pro** (`violet`, Qualcomm SM6150 / Snapdragon 675).
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Redmi Note 10 Pro, SM7150) to a different phone. Sweet's kernel patches `0001`-`0081` are used as they are. Violet adds its own storage, touch and backlight drivers plus boot tooling: patches `0082` and up, and the `violet/` directory. Sweet's original README is kept as [README.sweet.md](README.sweet.md).
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+> Experimental bring-up, not a usable phone OS. It boots to the iOS lock screen and home screen and responds to touch and the power key. Most hardware is not supported (see below). It installs into the `userdata` partition and so **erases Android's user data**.
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+## Status
 
-## What works
-
-| Area | State |
+| Area | State on violet |
 | --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
+| Boot | `fastboot boot` from RAM: bare-metal shim -> XNU. Nothing is flashed to boot partitions |
+| CPU | All 8 cores (6x Kryo 460 silver + 2x gold) through PSCI |
+| Storage | New polled eMMC driver (SDHC1, sdhci-msm-v5). iOS root is a journaled HFS+ volume in `userdata`, read/write |
+| Display | CPU-drawn 1125x2436 iPhone X image, centered on the 1080x2340 panel (continuous-splash framebuffer) |
+| Boot time | About 3.5 minutes to the lock screen on 8 cores |
+| Touch | Novatek NT36672A (in-cell TDDI) on QUP0 SE1 I2C, reset at start, one event read per INT pulse |
+| Edge gestures | Touch mapping is stretched at the cropped edges for the home swipe and Control Center (patch 0087, being tested) |
+| Buttons | Power key works (sweet's PMIC driver, same PM6150). Volume keys untested: broken hardware on the test unit |
+| Backlight | PM6150L WLED5 switched off/on with the display over SPMI |
+| Logs | Console mirrored to the Linux pstore zone, plus sweet's on-disk log ring at the end of `userdata` |
+| Not working | Wi-Fi, Bluetooth, cellular, audio, camera, GPU (no Adreno 612 driver), sensors, battery gauge, USB, real-time clock, brightness slider |
 
-## What does not work (yet)
+Device identity, activation bypass and the userland tweaks are sweet's: the phone presents itself as an iPhone X (`iPhone10,3` / `D22AP`).
 
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
+## Hardware notes (verified on the device)
 
-## How it boots
-
-```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
-```
-
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
-
-## How to do it yourself
-
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
-
-### 0. Back up the phone
-
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
-
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
-
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
-```
-
-### 1. Build the kernel
-
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
-
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
-```
-
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
-
-### 2. Build the iOS root image
-
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
-
-```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
-```
-
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
-
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
-```
-
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-What the less obvious boot-args do:
-
-| Boot-arg | Effect |
+| Block | Details |
 | --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
+| SoC | SM6150, MIDR 0x51DF805E, GICv3, PSCI 1.1, 19.2 MHz timer, 16K pages supported |
+| RAM | ~3.7 GB; XNU gets 0xA2000000 + 3.43 GiB |
+| eMMC | Samsung eMMC 5.1 (CID 0x15 "DH6DAB"), 62.5 GB, host at 0x7c4000. ABL powers the host down before jumping, so the driver does the full bring-up: PWRCTL handshake, 1.8 V pads, GCC SDCC1 clock (400 kHz, then 25 MHz 8-bit) |
+| Display | NT36672A "shenchao" video-mode DSI panel, framebuffer 0x9c000000, a8r8g8b8, stride 4320 |
+| Touch | NT36672A TDDI at I2C 0x01 (0x62 for reset), event buffer 0x21C00, INT GPIO89 (active low, ~120 Hz). The firmware does not report until the host sends a bootloader reset (`00 69` @0x62), and reads are valid only when timed to INT |
+| Backlight | PM6150L (SPMI SID 5) WLED5: ctrl 0xd800, sink 0xd900, 12-bit brightness |
+| Logs | Linux ramoops at 0xa1600000 (console 4 MiB) and 0xa1a00000 (pmsg 4 MiB) |
 
-### 4. Flash the root and boot
+## Repository layout (violet additions)
+
+| Path | Contents |
+| --- | --- |
+| `xnu/patches/0082-0087` | Violet kernel patches (below), applied after sweet's series by the same CI |
+| `violet/boot/` | Boot-image builder: shim (from sweet, adapted), `tools/mkadt_violet.py` (device tree), `mkpayload.py`, `mkboot.py`, `build.sh` |
+| `violet/boot/tools/boot-ios.sh` | Safe boot: arms `misc` with a "boot-recovery" message, then `fastboot boot` |
+| `violet/boot/tools/violet-log-pull.sh` | Reads the kernel/iOS log from the end of `userdata` through a root adb shell in recovery |
+| `violet/shim/` | Bare-metal probe shim used for bring-up (CPU, eMMC and touch tests). It logs to pstore and resets |
+
+| Patch | What it does |
+| --- | --- |
+| 0082 | eMMC root backend for `rd=ufsroot0` (sdhci-msm-v5, polled PIO, CMD18/25 with auto-CMD12), selected by ADT node `/violet-emmc` |
+| 0083 | Mirrors the console into the Linux pstore pmsg zone (`/violet-pstore`), so a run's whole log survives a warm reset |
+| 0084 | Warm reset after a panic (PSCI SYSTEM_RESET, boot-arg `panicreset=`), eMMC bring-up step log |
+| 0085 | Novatek NT36672A touch path (`/violet-touch`), panel-size-aware touch geometry, PM6150L WLED backlight off/on (`/violet-wled`) |
+| 0086 | Touch: bootloader reset at start, one event read per INT pulse, gap-timed register reads |
+| 0087 | Touch: stretched mapping at the cropped display edges, 30-second touch statistics in the log |
+
+## Requirements
+
+- A Redmi Note 7 Pro (violet) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build.
+- A recovery with a root adb shell for reading logs. The test unit uses OrangeFox, installed in the recovery partition.
+- Back up the boot chain first (at least `boot dtbo vbmeta recovery misc persist modemst1 modemst2 fsg fsc`). Bootloaders, modem and persist are never written; `misc` and `userdata` are.
+
+## Build and boot
+
+### 1. Kernel
+
+The kernel builds on GitHub's macOS runners (`macos-15`, Xcode 16). Fork this repo, enable Actions, and push or run:
 
 ```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
+gh workflow run xnu.yml -R YOU/ios-violet
+gh run download RUN_ID -R YOU/ios-violet -n xnu-kernel -D kernel/
 ```
 
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
+### 2. iOS root image
 
-### 5. Read the kernel log
+As in sweet: download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple, extract the OS, SystemOS and AppOS disk images (names are in `BuildManifest.plist`), then run `tools/mkiosroot.sh`, `fsck.hfsplus -fy`, mount, `tools/sweet-root-tweaks.py`, unmount, and `img2simg`. See [README.sweet.md](README.sweet.md) section 2.
+
+Linux's `fsck_hfs` keeps reporting "Volume header needs minor repair (1, 0)" even right after a repair. This is harmless.
+
+### 3. Flash the root
 
 ```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
+fastboot -S 16M flash userdata ios16-root.simg
 ```
 
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
+Use **16 MB** sparse chunks. On the test setup, single transfers above roughly 17 MB stall: with `-S 512M` the flash hung and nothing was written.
 
-### QEMU
+### 4. Boot image
 
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
+`violet/boot/tools/mkadt_violet.py` needs the raw iPhone X device tree (`DeviceTree.d22ap.im4p` from the IPSW, decompressed with `lzfse`) for `/product`. Point it there with `D22AP_ADT=`.
 
-## Repository layout
+```sh
+cd violet/boot
+STOCK=/path/to/stock-boot.img KDIR=/path/to/kernel ADT_FLAGS=--emmc D22AP_ADT=/path/to/d22ap.adt \
+CMDLINE="-v debug=0x10000c serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 \
+ unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 \
+ wdt=-1 sweetfb_noconsole=1 sweettouch=1 sweetkeys=1 sweetusb=0 sweetbattery=0 sweetlog=1 panicreset=30" \
+./build.sh
+cp out/xnu-boot.img out/ios-boot.img
+```
 
-| Path | What |
-| --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
+Keep the image under about 17 MB, for the same transfer limit.
 
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
+### 5. Boot
 
-## Kernel patches
+```sh
+SERIAL=<your-serial> tools/boot-ios.sh out/ios-boot.img
+```
 
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
+The first boot sits on a black screen for about 3.5 minutes. Tap the power key to wake the lock screen and swipe up to unlock.
 
-## Key hardware facts
+**Important: Android's `userdata` fstab entry is `formattable`.** If the phone ever boots Android normally with the iOS volume in `userdata`, Android may format it. `boot-ios.sh` therefore writes an AOSP "boot-recovery" message to `misc` before every boot. Qualcomm ABL honours it, so any reset out of iOS (panic, long power press) goes to recovery instead of Android. The recovery clears the message when it starts. To go back to Android, clear `misc` with `tools/mkbcb.py --clear` and wipe `userdata`.
 
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
+### 6. Logs
 
-More in [`NOTES.md`](NOTES.md).
+```sh
+SERIAL=<your-serial> violet/boot/tools/violet-log-pull.sh boot.txt      # from recovery (root adb)
+adb shell cat /sys/fs/pstore/pmsg-ramoops-0                             # console mirror, after a warm reset
+```
+
+## Bring-up notes
+
+- **ABL state.** ABL leaves the display on (continuous splash), but the eMMC host, the touch I2C engine and the touch firmware's reporting are all off. Every driver here starts from that state.
+- **Method.** Every device was first driven from the bare-metal shim (`violet/shim`, a one-minute test loop with results in pstore), then moved into the kernel.
+- **Touch.** Touch took the longest. Polling the event buffer without INT reads random IC memory: the firmware does not apply the register index outside its report window. The fix that matched Linux was a bootloader reset, then one read per INT pulse.
 
 ## Credits
 
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+- **Base port:** [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), whose kernel patches, userland tooling and drivers this port builds on (MIT).
+- **Open source used:** Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw).
+- **Hardware references:** Xiaomi/Qualcomm's published Linux kernel sources for violet (sdhci-msm, nt36xxx, qcom-spmi-wled, GCC/TLMM), mainline Linux and U-Boot.
+- **Recovery:** [OrangeFox Recovery](https://orangefox.download).
+- **Not distributed:** iOS itself is Apple's and is not included here.
+
+License: MIT (see [LICENSE](LICENSE)). The XNU patches are derived from APSL 2.0 sources.
