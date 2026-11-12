@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 53cfbe3..5d2dd49 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1398,6 +1398,22 @@ violet_platform_reset(int after_panic)
+ 	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+ }
+ 
++/*
++ * VIOLET: normal restart / shutdown (halt_all_cpus, osfmk/arm64/machine_routines.c).
++ * Without it iOS "Restart" and "Shut Down" spun forever. Restart = PSCI
++ * SYSTEM_RESET: a warm reset, so ABL boots the default OS (Android on the
++ * violet dual-boot layout). Halt = PSCI SYSTEM_OFF. The filesystem was synced
++ * and unmounted by userland before reboot(2); eMMC writes are synchronous.
++ */
++void violet_platform_halt(int reboot);
++
++void
++violet_platform_halt(int reboot)
++{
++	register uint64_t x0 __asm__("x0") = reboot ? 0x84000009u : 0x84000008u;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2..87d1f81 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -753,6 +753,12 @@ halt_all_cpus(boolean_t reboot)
+ 		printf("CPU halted\n");
+ 		PEHaltRestart(kPEHaltCPU);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* violet/sweet: no platform reset driver; restart = PSCI SYSTEM_RESET
++	 * (warm, boots the default OS), halt = PSCI SYSTEM_OFF. bsd/dev/sweet_ufs.c */
++	extern void violet_platform_halt(int reboot);
++	violet_platform_halt(reboot ? 1 : 0);
++#endif
+ 	while (1) {
+ 		;
+ 	}
