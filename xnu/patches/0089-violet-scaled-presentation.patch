@@ -1,0 +1,142 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 83a9830..d99415a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -106,6 +106,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScale;                   /* sweetfb_scale=1: scale logical -> panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -178,6 +179,15 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * violet: the 1080x2340 panel would lose 48 px at the top and bottom of
++	 * the 1125x2436 image (dock, status bar). Its aspect matches the iPhone X
++	 * within 0.1 %, so with boot-arg sweetfb_scale=1 the image is scaled by
++	 * ~0.96 instead of cropped (SweetHID.cpp maps touches the same way).
++	 */
++	int scale = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	fScale = scale != 0 && (fLogicalW != fWidth || fLogicalH != fHeight) && fWidth <= 4096;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -291,7 +301,49 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+-/* Copy each enabled layer's surface into the panel memory (no scaling). */
++/*
++ * Nearest-neighbour scaled copy of one layer: the logical rectangle
++ * (dx,dy,w,h) of a surface (source origin sx,sy) onto the panel. Panel pixel
++ * p shows logical coordinate p * log / panel; only panel pixels whose logical
++ * coordinate falls inside the rectangle are written. Called from present()
++ * (vsync timer, serialized), so the static column table is not shared.
++ */
++static uint32_t sweet_fb_xmap[4096];
++
++static void
++sweet_fb_blit_scaled(uintptr_t dst, uint32_t dstRowBytes, uint32_t panelW, uint32_t panelH,
++    uint32_t logW, uint32_t logH, uintptr_t src, uint32_t srcRowBytes,
++    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	int64_t px0 = ((int64_t)dx * panelW + logW - 1) / logW;
++	int64_t px1 = ((int64_t)(dx + w) * panelW + logW - 1) / logW;
++	int64_t py0 = ((int64_t)dy * panelH + logH - 1) / logH;
++	int64_t py1 = ((int64_t)(dy + h) * panelH + logH - 1) / logH;
++	if (px1 > (int64_t)panelW) {
++		px1 = panelW;
++	}
++	if (py1 > (int64_t)panelH) {
++		py1 = panelH;
++	}
++	if (px0 >= px1 || py0 >= py1 || px1 - px0 > 4096) {
++		return;
++	}
++	uint32_t n = (uint32_t)(px1 - px0);
++	for (uint32_t i = 0; i < n; i++) {
++		int64_t lx = (px0 + i) * (int64_t)logW / panelW;
++		sweet_fb_xmap[i] = (uint32_t)(sx + (lx - dx));
++	}
++	for (int64_t py = py0; py < py1; py++) {
++		int64_t ly = py * (int64_t)logH / panelH;
++		const uint32_t *sp = (const uint32_t *)(src + (uint64_t)(sy + (ly - dy)) * srcRowBytes);
++		uint32_t *dp = (uint32_t *)(dst + (uint64_t)py * dstRowBytes) + px0;
++		for (uint32_t i = 0; i < n; i++) {
++			dp[i] = sp[sweet_fb_xmap[i]];
++		}
++	}
++}
++
++/* Copy each enabled layer's surface into the panel memory (cropped, or scaled with sweetfb_scale). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+@@ -361,6 +413,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScale) {
++			/* clip to the source surface, then scale the logical rectangle */
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			uint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++			    (uint64_t)(sx + w) * 4;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
++			    s->elementHeight == 1 && s->memory != NULL && end <= s->memory->getLength()) {
++				sweet_fb_blit_scaled(fPixels, fRowBytes, fWidth, fHeight, fLogicalW, fLogicalH,
++				    src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 29da783..decf4c6 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -369,6 +369,7 @@ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	int fPanelW, fPanelH;
++	bool fScale;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -476,6 +477,10 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	fOffX = (fLogicalW - fPanelW) / 2;
+ 	fOffY = (fLogicalH - fPanelH) / 2;
++	/* Same switch as SweetFramebuffer.cpp: scaled (not cropped) presentation. */
++	int scale = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	fScale = scale != 0 && (fLogicalW != fPanelW || fLogicalH != fPanelH);
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -502,8 +507,12 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)sweet_edge_map(x, fPanelW, fLogicalW, 40) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)sweet_edge_map(y, fPanelH, fLogicalH, 60) << 16) / fLogicalH);
++	/* scaled presentation: the whole panel is the whole display (plain ratio);
++	 * cropped presentation: offset, stretched at the cut-off edges */
++	IOFixed nx = fScale ? (IOFixed)(((int64_t)x << 16) / fPanelW) :
++	    (IOFixed)(((int64_t)sweet_edge_map(x, fPanelW, fLogicalW, 40) << 16) / fLogicalW);
++	IOFixed ny = fScale ? (IOFixed)(((int64_t)y << 16) / fPanelH) :
++	    (IOFixed)(((int64_t)sweet_edge_map(y, fPanelH, fLogicalH, 60) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
