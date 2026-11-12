@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ff28d43..e1f3238 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -716,7 +716,10 @@ touch_thread(void *arg, wait_result_t result)
+ 		uint32_t last = touch_rd(st.gpio, TOUCH_GPIO_IO(st.irq_pin)) & 1u;
+ 		uint64_t last_frame = mach_absolute_time(), quiet;
+ 		nanoseconds_to_absolutetime(150ull * NSEC_PER_MSEC, &quiet);
+-		unsigned nerr = 0, frames = 0;
++		unsigned nerr = 0, frames = 0, contact_frames = 0, reports = 0;
++		uint64_t stat_next, stat_period;
++		nanoseconds_to_absolutetime(30ull * NSEC_PER_SEC, &stat_period);
++		stat_next = mach_absolute_time() + stat_period;
+ 		while (!st.dead) {
+ 			uint32_t lvl = touch_rd(st.gpio, TOUCH_GPIO_IO(st.irq_pin)) & 1u;
+ 			if (lvl == 0 && last == 1) {
+@@ -733,12 +736,23 @@ touch_thread(void *arg, wait_result_t result)
+ 					if (++frames == 1) {
+ 						printf("SWEET TOUCH: NT36672A first frame\n");
+ 					}
++					if (st.active) {
++						contact_frames++;
++					}
+ 				}
++				reports++;
+ 				last_frame = mach_absolute_time();
+ 			} else if (st.active && mach_absolute_time() - last_frame > quiet) {
+ 				touch_report(0, st.x, st.y);
+ 			}
+ 			last = lvl;
++			if (mach_absolute_time() > stat_next) {
++				/* idle diagnostics: INT pulses / frames with a contact in the last 30 s */
++				printf("SWEET TOUCH: 30s stats: int_pulses=%u contact_frames=%u active=%#x errs=%u\n",
++				    reports, contact_frames, st.active, nerr);
++				reports = contact_frames = 0;
++				stat_next = mach_absolute_time() + stat_period;
++			}
+ 			touch_wait(1);
+ 		}
+ 		touch_report(0, st.x, st.y);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 10c6b61..4aba81d 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -426,6 +426,32 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ }
+ 
++/*
++ * Panel pixel -> presented-display pixel. The 1125x2436 image is centered on
++ * the panel (SweetFramebuffer.cpp), so `off` pixels are cut off on each side
++ * (violet: 22 x, 48 y). A plain offset means a finger on the physical edge
++ * never reaches the display edge, and iOS edge gestures (home swipe from the
++ * bottom, Control Center / notifications from the top) cannot start. Inside
++ * a `band` of panel pixels at each edge the mapping is stretched so the
++ * physical edge reaches the display edge; elsewhere it stays 1:1.
++ */
++static int
++sweet_edge_map(int v, int panel, int logical, int band)
++{
++	int off = (logical - panel) / 2;
++	if (off <= 0 || band <= 0 || 2 * band >= panel) {
++		return v + (off > 0 ? off : 0);
++	}
++	if (v < band) {
++		return v * (band + off) / band;
++	}
++	if (v >= panel - band) {
++		int far = logical - 1, start = panel - band + off;
++		return start + (v - (panel - band)) * (far - start) / (band - 1);
++	}
++	return v + off;
++}
++
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
+@@ -476,8 +502,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	IOFixed nx = (IOFixed)(((int64_t)sweet_edge_map(x, fPanelW, fLogicalW, 40) << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)sweet_edge_map(y, fPanelH, fLogicalH, 60) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
