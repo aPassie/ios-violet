@@ -1,0 +1,84 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5d2dd49..bf5729e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -551,6 +551,65 @@ emmc_take_over_host(void)
+ 	return 0;
+ }
+ 
++/*
++ * VIOLET dual boot: iOS lives in unpartitioned space after Android's userdata.
++ * (A 88th GPT entry for it overflowed Xiaomi ABL's partition list: fastboot
++ * writes crashed.) boot-args ufsroot_lba=<first sector> ufsroot_sectors=<n>
++ * select that range instead of a GPT name; it must not overlap any GPT entry.
++ */
++static int
++emmc_root_by_range(uint64_t first, uint64_t nsect, const uint8_t *entries, uint32_t nent, uint32_t esz)
++{
++	if (first % EMMC_SPB || nsect < 2 * EMMC_SPB) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = entries + i * esz;
++		uint64_t f, l;
++		memcpy(&f, e + 32, 8);
++		memcpy(&l, e + 40, 8);
++		if (f == 0 && l == 0) {
++			continue;
++		}
++		if (f < first + nsect && l >= first) {
++			printf("VIOLET EMMC: root range overlaps GPT entry %u (0x%llx..0x%llx)\n", i, f, l);
++			return EPERM;
++		}
++	}
++	su.first_block = first / EMMC_SPB;
++	su.nblocks = nsect / EMMC_SPB;
++	printf("VIOLET EMMC: root by range: sectors 0x%llx +0x%llx (no GPT entry)\n", first, nsect);
++	return 0;
++}
++
++/*
++ * VIOLET dual boot: iOS boots from the recovery partition. ABL keeps obeying an
++ * AOSP "boot-recovery" message in misc until a recovery clears it; iOS never
++ * did, so every boot went to iOS. Clear it here, once per iOS boot: the only
++ * write outside the iOS range, 4 sectors at the start of the GPT entry "misc",
++ * and only when it holds "boot-recovery".
++ */
++static void
++emmc_clear_misc_bcb(const uint8_t *entries, uint32_t nent, uint32_t esz)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE + BOUNCE_SIZE - 2048);
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = entries + i * esz;
++		if (e[56] != 'm' || e[57] || e[58] != 'i' || e[60] != 's' || e[62] != 'c' || e[64] || e[65]) {
++			continue;
++		}
++		uint64_t f;
++		memcpy(&f, e + 32, 8);
++		if (emmc_xfer(f, 1, b, false) || memcmp(b, "boot-recovery", 13) != 0) {
++			return;
++		}
++		bzero(b, 2048);
++		int error = emmc_xfer(f, 4, b, true);
++		printf("VIOLET EMMC: cleared misc boot-recovery message (err %d)\n", error);
++		return;
++	}
++}
++
+ static int
+ emmc_find_partition(const char *want)
+ {
+@@ -576,6 +635,13 @@ emmc_find_partition(const char *want)
+ 	if ((error = emmc_xfer(entry_lba, nsect, b, false))) {
+ 		return error;
+ 	}
++	/* entries stay in the first part of the bounce buffer below */
++	emmc_clear_misc_bcb(b, nent, esz);
++	uint64_t rfirst = 0, rcount = 0;
++	if (PE_parse_boot_argn("ufsroot_lba", &rfirst, sizeof(rfirst)) &&
++	    PE_parse_boot_argn("ufsroot_sectors", &rcount, sizeof(rcount))) {
++		return emmc_root_by_range(rfirst, rcount, b, nent, esz);
++	}
+ 	for (uint32_t i = 0; i < nent; i++) {
+ 		const uint8_t *e = b + i * esz;
+ 		char name[37];
